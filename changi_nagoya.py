@@ -5,12 +5,13 @@
 # @brief          Changi Airport 貨物便 名古屋(NGO)関連便 Discord 通知スクリプト
 # @author         Kidera Shunsuke
 # @date           2026/11/08
-# $Version:       1.00
-# $Revision:      2026/11/08
+# $Version:       1.01
+# $Revision:      2026/11/09
 # @note           changiairport.com の GraphQL API から出発・到着便を取得し NGO 関連便を通知
 # @attention      プロジェクトのコーディングフォーマット・コメントフォーマット遵守
 # @par            History
 #                 v1.00 (2026/11/08) - 新規作成
+#                 v1.01 (2026/11/09) - GraphQL 部分エラー（airport_details null）で全体が失敗しないよう修正
 # Copyright (c) 2026. All Rights reserved.
 #
 # -----------------------------------------------------------------------------------#
@@ -127,6 +128,16 @@ FLIGHT_FIELDS = """
   }
 """
 
+# v1.01: airport_details / via_airport_details を除いた予備フィールド定義。
+#   サーバ側で空港マスタに無いコード（チャーター便等）が混ざると
+#   「Cannot return null for non-nullable type ... AirportDetail」エラーになるため、
+#   data が丸ごと null になった場合はこちらで再取得する（名古屋判定は airport / via の
+#   IATA コードだけでも可能）。
+FLIGHT_FIELDS_MINIMAL = "\n".join(
+    line for line in FLIGHT_FIELDS.splitlines()
+    if "airport_details" not in line
+)
+
 # HTTP リクエスト用 User-Agent
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 
@@ -218,7 +229,8 @@ def resolve_api_key(session: requests.Session) -> str:
 # ======================================================================================#
 # @function name:   build_query
 # @function start
-def build_query(direction: str, date_str: str, freighter_only: bool, next_token: str | None) -> str:
+def build_query(direction: str, date_str: str, freighter_only: bool, next_token: str | None,
+                fields: str = FLIGHT_FIELDS) -> str:
     """
     ----------------------------------------------------------------------
     関数概要：getFlights の GraphQL クエリ文字列を組み立てる
@@ -228,6 +240,7 @@ def build_query(direction: str, date_str: str, freighter_only: bool, next_token:
         - date_str -> str --- 対象日（YYYY-MM-DD）
         - freighter_only -> bool --- 貨物便のみ対象にするかどうか
         - next_token -> str | None --- ページング用トークン（先頭ページは None）
+        - fields -> str --- 取得フィールド定義（既定 FLIGHT_FIELDS、予備 FLIGHT_FIELDS_MINIMAL）
     ----------------------------------------------------------------------
     Returns:
         - query -> str --- GraphQL クエリ文字列
@@ -235,6 +248,7 @@ def build_query(direction: str, date_str: str, freighter_only: bool, next_token:
     Notes:
         - author         Kidera-Shunsuke
         - revision       v1.00 (2026/11/08) - 新規作成
+        - revision       v1.01 (2026/11/09) - fields 引数追加（予備フィールドでの再取得用）
     ----------------------------------------------------------------------
     """
     args = [f'direction: "{direction}"']
@@ -246,7 +260,7 @@ def build_query(direction: str, date_str: str, freighter_only: bool, next_token:
         args.append('page_size: "100"')
     if next_token:
         args.append(f'next_token: "{next_token}"')
-    return "query { getFlights(" + ", ".join(args) + ") {" + FLIGHT_FIELDS + "} }"
+    return "query { getFlights(" + ", ".join(args) + ") {" + fields + "} }"
 
 
 # @function name:   build_query
@@ -276,24 +290,44 @@ def fetch_flights(session: requests.Session, headers: dict, direction: str, date
     ----------------------------------------------------------------------
     Raises:
         - requests.HTTPError --- HTTP ステータスがエラーの場合
-        - RuntimeError --- GraphQL レスポンスに errors が含まれる場合
+        - RuntimeError --- GraphQL レスポンスに errors が含まれ、便一覧が取得できなかった場合
     ----------------------------------------------------------------------
     Notes:
         - author         Kidera-Shunsuke
         - revision       v1.00 (2026/11/08) - 新規作成
+        - revision       v1.01 (2026/11/09) - 部分エラー（airport_details が null）を許容し、
+                                               便一覧が取れない場合は予備フィールドで再取得
     ----------------------------------------------------------------------
     """
     flights: list[dict] = []
     next_token = None
     for _ in range(max_pages):
-        payload = {"query": build_query(direction, date_str, freighter_only, next_token)}
-        resp = session.post(GRAPHQL_ENDPOINT, headers=headers, json=payload, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-        if data.get("errors"):
-            raise RuntimeError(f"GraphQL error: {json.dumps(data['errors'], ensure_ascii=False)}")
-        result = (data.get("data") or {}).get("getFlights") or {}
-        page = result.get("flights") or []
+        page = None
+        last_errors = None
+        # 1 回目は全フィールド、便一覧が返らなければ airport_details 抜きの予備フィールドで再試行
+        for fields in (FLIGHT_FIELDS, FLIGHT_FIELDS_MINIMAL):
+            payload = {"query": build_query(direction, date_str, freighter_only, next_token, fields)}
+            resp = session.post(GRAPHQL_ENDPOINT, headers=headers, json=payload, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+            result = (data.get("data") or {}).get("getFlights") or {}
+            errors = data.get("errors")
+            if errors:
+                last_errors = errors
+                if isinstance(result.get("flights"), list):
+                    # 部分エラー: 一部の便の airport_details だけ null になっているケース。
+                    # 便一覧自体は返っているので警告だけ出して続行（名古屋判定は airport / via コードで可能）
+                    print(f"[WARN] {direction} {date_str}: GraphQL 部分エラー {len(errors)} 件を無視して続行 "
+                          f"({errors[0].get('message', '')[:80]})", file=sys.stderr)
+                else:
+                    # data が丸ごと null → 予備フィールドで再取得
+                    print(f"[WARN] {direction} {date_str}: GraphQL エラーのため予備フィールドで再取得します",
+                          file=sys.stderr)
+                    continue
+            page = result.get("flights") or []
+            break
+        if page is None:
+            raise RuntimeError(f"GraphQL error: {json.dumps(last_errors, ensure_ascii=False)}")
         # 方向情報が無い場合は補完
         for f in page:
             f.setdefault("direction", direction)
