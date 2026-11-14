@@ -1,0 +1,32 @@
+# 機密情報
+notified_state.json
+
+.env
+
+
+/.github
+
+# IDE
+/.idea
+/.vscode
+
+# Python
+__pycache__/
+arrival/__pycache__/
+departure/__pycache__/
+ground/__pycache__/
+# --- IGNORE ---
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# ログ・出力ファイル
+/log
+
+# OS固有
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
